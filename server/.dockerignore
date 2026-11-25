@@ -1,0 +1,6 @@
+node_modules
+uploads
+chat.db
+chat.db-*
+data.json
+.env

@@ -1,0 +1,96 @@
+# Local dev stack: MinIO (media storage) + Node API + React client.
+# Start everything:  docker compose up --build
+# App:            http://localhost:5173
+# API:            http://localhost:4000
+# MinIO console:  http://localhost:9001  (login: chatminio / chatminiosecret)
+
+services:
+  # The official minio/minio and minio/mc images were removed from Docker Hub, and
+  # quay.io refuses anonymous pulls. pgsty/* are community builds of the same MinIO
+  # source with the same CLI. Pinned to a release so an upstream change can't break boot.
+  minio:
+    image: pgsty/minio:RELEASE.2026-08-04T00-00-00Z
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: chatminio
+      MINIO_ROOT_PASSWORD: chatminiosecret
+      # The browser fetches media straight from MinIO (a different origin than the app),
+      # and the lightbox's Download button needs CORS for that. Dev-only setting.
+      MINIO_API_CORS_ALLOW_ORIGIN: "http://localhost:5173"
+    ports:
+      - "9000:9000" # S3 API, also where the browser loads images/videos from
+      - "9001:9001" # web console
+    volumes:
+      - chat_minio_data:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # One-shot job: creates the bucket and allows anonymous reads, so <img src> works
+  # without signed URLs. Safe to re-run (-p and the policy command are idempotent).
+  minio-init:
+    image: pgsty/mc:RELEASE.2026-09-16T00-00-00Z
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+      mc alias set local http://minio:9000 chatminio chatminiosecret &&
+      mc mb -p local/chat-media &&
+      mc anonymous set download local/chat-media &&
+      exit 0
+      "
+
+  server:
+    build:
+      context: ./server
+    environment:
+      PORT: 4000
+      CLIENT_ORIGIN: http://localhost:5173
+      JWT_SECRET: ${JWT_SECRET:-dev-only-secret-change-me}
+      DATA_DIR: /data # SQLite database lives in the chat_server_data volume
+      STORAGE_DRIVER: minio
+      # Two addresses for the same MinIO: the server uploads over the Docker network
+      # (hostname "minio"), but the URLs it stores must work in your browser, which
+      # can't resolve "minio". Hence the separate public URL.
+      MINIO_ENDPOINT: minio
+      MINIO_PORT: 9000
+      MINIO_USE_SSL: "false"
+      MINIO_ACCESS_KEY: chatminio
+      MINIO_SECRET_KEY: chatminiosecret
+      MINIO_BUCKET: chat-media
+      MINIO_PUBLIC_URL: http://localhost:9000
+    ports:
+      - "4000:4000"
+    depends_on:
+      minio-init:
+        condition: service_completed_successfully
+    volumes:
+      - ./server:/app
+      # Keep the container's own node_modules instead of the host's.
+      - /app/node_modules
+      - chat_server_data:/data
+    # --watch restarts on source changes. npm install reconciles the anonymous
+    # node_modules volume when a dependency is added, without a volume reset.
+    command: sh -c "npm install --omit=dev && node --watch index.js"
+
+  client:
+    build:
+      context: ./client
+    environment:
+      # Read by the browser, so it points at the host port, not the "server" hostname.
+      VITE_API_URL: http://localhost:4000
+    ports:
+      - "5173:5173"
+    depends_on:
+      - server
+    volumes:
+      - ./client:/app
+      - /app/node_modules
+    command: sh -c "npm install && npm run dev -- --host"
+
+volumes:
+  chat_minio_data:
+  chat_server_data:
