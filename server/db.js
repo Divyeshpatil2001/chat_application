@@ -58,7 +58,37 @@ conn.exec(`
     user_id TEXT NOT NULL REFERENCES users(id),
     PRIMARY KEY (message_id, user_id)
   );
+  CREATE TABLE IF NOT EXISTS message_reactions (
+    message_id TEXT NOT NULL REFERENCES messages(id),
+    user_id TEXT NOT NULL REFERENCES users(id),
+    emoji TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (message_id, user_id, emoji)
+  );
+  -- One row per (message, recipient). delivered_at is set when the recipient's client
+  -- receives it; read_at when they view the conversation with the window focused.
+  CREATE TABLE IF NOT EXISTS message_receipts (
+    message_id TEXT NOT NULL REFERENCES messages(id),
+    user_id TEXT NOT NULL REFERENCES users(id),
+    delivered_at TEXT NOT NULL,
+    read_at TEXT,
+    PRIMARY KEY (message_id, user_id)
+  );
+  CREATE INDEX IF NOT EXISTS idx_receipts_user ON message_receipts(user_id);
+  -- data is NULL when the fetch failed, so failures are cached too (with a shorter TTL).
+  CREATE TABLE IF NOT EXISTS link_previews (
+    url TEXT PRIMARY KEY,
+    data TEXT,
+    fetched_at TEXT NOT NULL
+  );
 `);
+
+// CREATE TABLE IF NOT EXISTS doesn't add columns to a table that already exists,
+// so columns introduced after the first release are added here for older databases.
+const messageColumns = new Set(conn.prepare('PRAGMA table_info(messages)').all().map((c) => c.name));
+for (const [name, type] of [['reply_to_id', 'TEXT'], ['mentions', 'TEXT'], ['link_preview', 'TEXT']]) {
+  if (!messageColumns.has(name)) conn.exec(`ALTER TABLE messages ADD COLUMN ${name} ${type}`);
+}
 
 const stmt = (sql) => conn.prepare(sql);
 
@@ -92,14 +122,42 @@ const q = {
   getDeletedAt: stmt('SELECT deleted_at FROM conversation_members WHERE conversation_id = ? AND user_id = ?'),
 
   insertMessage: stmt(`
-    INSERT INTO messages (id, conversation_id, sender_id, sender_name, text, attachment_url, attachment_type, attachment_name, is_system, created_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    INSERT INTO messages (id, conversation_id, sender_id, sender_name, text, attachment_url, attachment_type, attachment_name, is_system, reply_to_id, mentions, link_preview, created_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `),
   messageById: stmt('SELECT * FROM messages WHERE id = ?'),
   messagesForConversation: stmt('SELECT * FROM messages WHERE conversation_id = ? ORDER BY created_at'),
   messagesForConversationSince: stmt('SELECT * FROM messages WHERE conversation_id = ? AND created_at > ? ORDER BY created_at'),
   setDeletedForEveryone: stmt('UPDATE messages SET deleted_for_everyone = 1 WHERE id = ?'),
-  editMessageText: stmt('UPDATE messages SET text = ?, edited_at = ? WHERE id = ?'),
+  editMessageText: stmt('UPDATE messages SET text = ?, mentions = ?, link_preview = ?, edited_at = ? WHERE id = ?'),
+  setLinkPreview: stmt('UPDATE messages SET link_preview = ? WHERE id = ?'),
+  reactionsFor: stmt('SELECT user_id, emoji FROM message_reactions WHERE message_id = ? ORDER BY created_at'),
+  hasReaction: stmt('SELECT 1 FROM message_reactions WHERE message_id = ? AND user_id = ? AND emoji = ?'),
+  countUserReactions: stmt('SELECT COUNT(*) AS n FROM message_reactions WHERE message_id = ? AND user_id = ?'),
+  addReaction: stmt('INSERT OR IGNORE INTO message_reactions (message_id, user_id, emoji, created_at) VALUES (?, ?, ?, ?)'),
+  removeReaction: stmt('DELETE FROM message_reactions WHERE message_id = ? AND user_id = ? AND emoji = ?'),
+  receiptsFor: stmt('SELECT user_id, read_at FROM message_receipts WHERE message_id = ?'),
+  markDelivered: stmt('INSERT OR IGNORE INTO message_receipts (message_id, user_id, delivered_at) VALUES (?, ?, ?)'),
+  markRead: stmt(`
+    INSERT INTO message_receipts (message_id, user_id, delivered_at, read_at) VALUES (?, ?, ?, ?)
+    ON CONFLICT (message_id, user_id) DO UPDATE SET read_at = excluded.read_at WHERE read_at IS NULL
+  `),
+  undeliveredForUser: stmt(`
+    SELECT m.id, m.conversation_id FROM messages m
+    JOIN conversation_members cm ON cm.conversation_id = m.conversation_id AND cm.user_id = ?
+    LEFT JOIN message_receipts r ON r.message_id = m.id AND r.user_id = cm.user_id
+    WHERE m.sender_id != cm.user_id AND m.is_system = 0 AND r.message_id IS NULL
+  `),
+  unreadInConversation: stmt(`
+    SELECT m.id FROM messages m
+    LEFT JOIN message_receipts r ON r.message_id = m.id AND r.user_id = ?
+    WHERE m.conversation_id = ? AND m.sender_id != ? AND m.is_system = 0 AND r.read_at IS NULL
+  `),
+  linkPreview: stmt('SELECT data, fetched_at FROM link_previews WHERE url = ?'),
+  saveLinkPreview: stmt(`
+    INSERT INTO link_previews (url, data, fetched_at) VALUES (?, ?, ?)
+    ON CONFLICT (url) DO UPDATE SET data = excluded.data, fetched_at = excluded.fetched_at
+  `),
   addMessageDeletion: stmt('INSERT OR IGNORE INTO message_deletions (message_id, user_id) VALUES (?, ?)'),
   isMessageDeletedForUser: stmt('SELECT 1 FROM message_deletions WHERE message_id = ? AND user_id = ?'),
 };
@@ -115,8 +173,12 @@ const toCamelMessage = (r) =>
     isSystem: !!r.is_system,
     deletedForEveryone: !!r.deleted_for_everyone,
     editedAt: r.edited_at,
+    replyToId: r.reply_to_id,
+    mentions: r.mentions ? JSON.parse(r.mentions) : [],
+    linkPreview: r.link_preview ? JSON.parse(r.link_preview) : null,
     createdAt: r.created_at,
   };
+const jsonOrNull = (v) => (v == null ? null : JSON.stringify(v));
 
 const toCamelConversation = (r) => r && { id: r.id, type: r.type, name: r.name, adminId: r.admin_id, createdAt: r.created_at };
 
@@ -181,7 +243,7 @@ export const db = {
   },
 
   // ---- messages ----
-  createMessage({ id, conversationId, senderId, senderName, text, attachment, isSystem, createdAt }) {
+  createMessage({ id, conversationId, senderId, senderName, text, attachment, isSystem, replyToId, mentions, linkPreview, createdAt }) {
     q.insertMessage.run(
       id,
       conversationId,
@@ -192,6 +254,9 @@ export const db = {
       attachment?.type ?? null,
       attachment?.name ?? null,
       isSystem ? 1 : 0,
+      replyToId ?? null,
+      mentions?.length ? JSON.stringify(mentions) : null,
+      jsonOrNull(linkPreview),
       createdAt
     );
     return toCamelMessage(q.messageById.get(id));
@@ -206,8 +271,78 @@ export const db = {
   setDeletedForEveryone(messageId) {
     q.setDeletedForEveryone.run(messageId);
   },
-  editMessage(messageId, text, editedAt) {
-    q.editMessageText.run(text, editedAt, messageId);
+  editMessage(messageId, { text, mentions, linkPreview }, editedAt) {
+    q.editMessageText.run(text, mentions?.length ? JSON.stringify(mentions) : null, jsonOrNull(linkPreview), editedAt, messageId);
+  },
+  setLinkPreview(messageId, preview) {
+    q.setLinkPreview.run(jsonOrNull(preview), messageId);
+  },
+  // ---- reactions ----
+  // Returns { emoji: [userId, ...] } in the order reactions were first added.
+  getReactions(messageId) {
+    const out = {};
+    for (const r of q.reactionsFor.all(messageId)) (out[r.emoji] ||= []).push(r.user_id);
+    return out;
+  },
+  hasReaction(messageId, userId, emoji) {
+    return !!q.hasReaction.get(messageId, userId, emoji);
+  },
+  countUserReactions(messageId, userId) {
+    return q.countUserReactions.get(messageId, userId).n;
+  },
+  addReaction(messageId, userId, emoji, createdAt) {
+    q.addReaction.run(messageId, userId, emoji, createdAt);
+  },
+  removeReaction(messageId, userId, emoji) {
+    q.removeReaction.run(messageId, userId, emoji);
+  },
+  // ---- receipts ----
+  getReceipts(messageId) {
+    const rows = q.receiptsFor.all(messageId);
+    return { deliveredTo: rows.map((r) => r.user_id), readBy: rows.filter((r) => r.read_at).map((r) => r.user_id) };
+  },
+  markDelivered(messageId, userId, iso) {
+    return q.markDelivered.run(messageId, userId, iso).changes > 0;
+  },
+  // Marks every message from others in the conversation as read; returns the ids that changed.
+  markConversationRead(conversationId, userId, iso) {
+    const ids = q.unreadInConversation.all(userId, conversationId, userId).map((r) => r.id);
+    if (!ids.length) return ids;
+    conn.exec('BEGIN');
+    try {
+      for (const mid of ids) q.markRead.run(mid, userId, iso, iso);
+      conn.exec('COMMIT');
+    } catch (err) {
+      conn.exec('ROLLBACK');
+      throw err;
+    }
+    return ids;
+  },
+  // Marks everything the user hasn't received yet as delivered; returns { conversationId: [messageId] }.
+  markAllDelivered(userId, iso) {
+    const rows = q.undeliveredForUser.all(userId);
+    const byConversation = {};
+    if (!rows.length) return byConversation;
+    conn.exec('BEGIN');
+    try {
+      for (const r of rows) {
+        q.markDelivered.run(r.id, userId, iso);
+        (byConversation[r.conversation_id] ||= []).push(r.id);
+      }
+      conn.exec('COMMIT');
+    } catch (err) {
+      conn.exec('ROLLBACK');
+      throw err;
+    }
+    return byConversation;
+  },
+  // ---- link preview cache ----
+  getLinkPreview(url) {
+    const r = q.linkPreview.get(url);
+    return r && { data: r.data ? JSON.parse(r.data) : null, fetchedAt: r.fetched_at };
+  },
+  saveLinkPreview(url, data, iso) {
+    q.saveLinkPreview.run(url, jsonOrNull(data), iso);
   },
   addMessageDeletionForUser(messageId, userId) {
     q.addMessageDeletion.run(messageId, userId);

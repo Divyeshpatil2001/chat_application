@@ -1,38 +1,24 @@
 import { useEffect, useRef, useState } from 'react';
-import { mediaUrl } from '../api.js';
 import Lightbox from './Lightbox.jsx';
+import Message, { replyPreviewText } from './Message.jsx';
+import EmojiPicker from './EmojiPicker.jsx';
 
-const time = (iso) => new Date(iso).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+const QUICK_REACTIONS = ['👍', '❤️', '😂', '😮', '😢', '🙏'];
 
-function Attachment({ attachment, onPreview }) {
-  const src = mediaUrl(attachment.url);
-  if (attachment.type === 'video')
-    return (
-      <div className="attachment-wrap">
-        <video src={src} controls className="attachment attachment-video" />
-        <button type="button" className="icon-btn expand-btn" title="Full screen" onClick={() => onPreview({ ...attachment, url: src })}>⤢</button>
-      </div>
-    );
-  return (
-    <img
-      src={src}
-      alt={attachment.name || 'photo'}
-      className="attachment attachment-img"
-      onClick={() => onPreview({ ...attachment, url: src })}
-    />
-  );
-}
-
-export default function ChatWindow({ user, users, conversation, messages, typing, onSend, onSendFile, onDeleteMessage, onEditMessage, onTyping, onAddPeople, onLeave, onClose }) {
+export default function ChatWindow({ user, users, conversation, messages, typing, theme, onSend, onSendFile, onDeleteMessage, onEditMessage, onReact, onTyping, onAddPeople, onLeave, onClose }) {
   const [text, setText] = useState('');
   const [showMembers, setShowMembers] = useState(false);
   const [menu, setMenu] = useState(null); // { message, x, y } | null — screen coords, so it floats above everything
   const [preview, setPreview] = useState(null); // attachment being shown full-screen, or null
   const [editingId, setEditingId] = useState(null);
+  const [replyTo, setReplyTo] = useState(null); // message being replied to, or null
+  const [picker, setPicker] = useState(null); // null | { target: 'composer' } | { target: 'reaction', messageId }
   const [uploading, setUploading] = useState(false);
   const [uploadError, setUploadError] = useState('');
   const bottomRef = useRef(null);
   const fileInputRef = useRef(null);
+  const inputRef = useRef(null);
+
   const isGroup = conversation.type === 'group';
   const other = !isGroup && users.find((u) => conversation.members.some((m) => m.id === u.id));
 
@@ -45,6 +31,8 @@ export default function ChatWindow({ user, users, conversation, messages, typing
     setMenu(null);
     setPreview(null);
     setEditingId(null);
+    setReplyTo(null);
+    setPicker(null);
     setText('');
   }, [conversation.id]);
 
@@ -60,20 +48,63 @@ export default function ChatWindow({ user, users, conversation, messages, typing
       onEditMessage(editingId, text);
       setEditingId(null);
     } else {
-      onSend(text);
+      onSend(text, replyTo?.id);
+      setReplyTo(null);
     }
     setText('');
   }
 
   function startEdit(message) {
     setMenu(null);
+    setReplyTo(null);
     setEditingId(message.id);
     setText(message.text || '');
+    inputRef.current?.focus();
   }
 
   function cancelEdit() {
     setEditingId(null);
     setText('');
+  }
+
+  function startReply(message) {
+    setMenu(null);
+    if (editingId) cancelEdit();
+    setReplyTo(message);
+    inputRef.current?.focus();
+  }
+
+  function react(messageId, emoji) {
+    setMenu(null);
+    onReact(messageId, emoji);
+  }
+
+  // Inserts at the caret instead of appending, then puts the caret after the emoji.
+  function insertEmoji(emoji) {
+    const input = inputRef.current;
+    const start = input?.selectionStart ?? text.length;
+    const end = input?.selectionEnd ?? text.length;
+    setText(text.slice(0, start) + emoji + text.slice(end));
+    requestAnimationFrame(() => {
+      input?.focus();
+      input?.setSelectionRange(start + emoji.length, start + emoji.length);
+    });
+  }
+
+  function pickEmoji(emoji) {
+    if (picker?.target === 'reaction') {
+      onReact(picker.messageId, emoji);
+      setPicker(null);
+    } else insertEmoji(emoji);
+  }
+
+  function jumpTo(messageId) {
+    const el = document.getElementById(`msg-${messageId}`);
+    if (!el) return;
+    el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    el.classList.remove('flash');
+    void el.offsetWidth; // restart the animation if it's already running
+    el.classList.add('flash');
   }
 
   async function pickFile(e) {
@@ -83,7 +114,8 @@ export default function ChatWindow({ user, users, conversation, messages, typing
     setUploadError('');
     setUploading(true);
     try {
-      await onSendFile(file);
+      await onSendFile(file, replyTo?.id);
+      setReplyTo(null);
     } catch (err) {
       setUploadError(err.message);
     } finally {
@@ -127,31 +159,20 @@ export default function ChatWindow({ user, users, conversation, messages, typing
             m.system ? (
               <div key={m.id} className="system">{m.text}</div>
             ) : (
-              <div key={m.id} className={`msg ${m.senderId === user.id ? 'mine' : ''}`}>
-                {isGroup && m.senderId !== user.id && !m.deleted && <div className="sender">{m.senderName}</div>}
-
-                {!m.deleted && (
-                  <button className="icon-btn msg-menu-btn" onClick={(e) => openMenu(e, m)}>⋮</button>
-                )}
-
-                {m.deleted ? (
-                  <div className="deleted-text">🚫 This message was deleted</div>
-                ) : (
-                  <>
-                    {m.attachment && <Attachment attachment={m.attachment} onPreview={setPreview} />}
-                    {m.text && <div className="msg-text">{m.text}</div>}
-                  </>
-                )}
-                <div className="time">
-                  {m.editedAt && !m.deleted && <span className="edited-tag">edited · </span>}
-                  {time(m.createdAt)}
-                </div>
-              </div>
+              <Message
+                key={m.id}
+                message={m}
+                user={user}
+                conversation={conversation}
+                onMenu={openMenu}
+                onPreview={setPreview}
+                onReact={onReact}
+                onJumpTo={jumpTo}
+              />
             )
           )}
           <div ref={bottomRef} />
         </div>
-
         {showMembers && (
           <aside className="members">
             <h4>Members</h4>
@@ -170,7 +191,22 @@ export default function ChatWindow({ user, users, conversation, messages, typing
       {menu && (
         <>
           <div className="menu-backdrop" onClick={() => setMenu(null)} />
-          <div className="msg-menu" style={{ top: menu.y + 4, left: menu.x - 170 }}>
+          <div className="msg-menu" style={{ top: Math.min(menu.y + 4, window.innerHeight - 230), left: Math.max(8, menu.x - 230) }}>
+            <div className="quick-reactions">
+              {QUICK_REACTIONS.map((emoji) => (
+                <button key={emoji} title={`React ${emoji}`} onClick={() => react(menu.message.id, emoji)}>{emoji}</button>
+              ))}
+              <button
+                title="More reactions"
+                onClick={() => {
+                  setPicker({ target: 'reaction', messageId: menu.message.id });
+                  setMenu(null);
+                }}
+              >
+                ＋
+              </button>
+            </div>
+            <button onClick={() => startReply(menu.message)}>Reply</button>
             {menu.message.senderId === user.id && menu.message.text && (
               <button onClick={() => startEdit(menu.message)}>Edit</button>
             )}
@@ -189,6 +225,16 @@ export default function ChatWindow({ user, users, conversation, messages, typing
           <button type="button" className="link" onClick={cancelEdit}>Cancel</button>
         </div>
       )}
+      {replyTo && (
+        <div className="reply-banner">
+          <div className="grow">
+            <strong>Replying to {replyTo.senderId === user.id ? 'yourself' : replyTo.senderName}</strong>
+            <small className="muted ellipsis">{replyPreviewText({ text: replyTo.text, attachmentType: replyTo.attachment?.type })}</small>
+          </div>
+          <button type="button" className="icon-btn" title="Cancel reply" onClick={() => setReplyTo(null)}>✕</button>
+        </div>
+      )}
+      {picker && <EmojiPicker theme={theme} onPick={pickEmoji} onClose={() => setPicker(null)} />}
       <form className="composer" onSubmit={submit}>
         <input ref={fileInputRef} type="file" accept="image/*,video/*" hidden onChange={pickFile} />
         <button
@@ -200,15 +246,28 @@ export default function ChatWindow({ user, users, conversation, messages, typing
         >
           {uploading ? '…' : '📎'}
         </button>
+        <button
+          type="button"
+          className="icon-btn attach-btn"
+          title="Insert emoji"
+          onClick={() => setPicker((p) => (p?.target === 'composer' ? null : { target: 'composer' }))}
+        >
+          😊
+        </button>
         <input
+          ref={inputRef}
           placeholder="Type a message…"
           value={text}
           onChange={(e) => { setText(e.target.value); onTyping(); }}
+          onKeyDown={(e) => {
+            if (e.key !== 'Escape') return;
+            if (editingId) cancelEdit();
+            else setReplyTo(null);
+          }}
           autoFocus
         />
         <button type="submit">{editingId ? 'Update' : 'Send'}</button>
       </form>
-
       {preview && <Lightbox attachment={preview} onClose={() => setPreview(null)} />}
     </main>
   );

@@ -9,6 +9,7 @@ import multer from 'multer';
 import { Server } from 'socket.io';
 import { db } from './db.js';
 import { initStorage, saveFile, uploadsDir } from './storage.js';
+import { extractFirstUrl, getCachedPreview, getLinkPreview, normalizeUrl } from './linkPreview.js';
 
 const PORT = process.env.PORT || 4000;
 const CLIENT_ORIGIN = process.env.CLIENT_ORIGIN || 'http://localhost:5173';
@@ -36,6 +37,9 @@ const io = new Server(server, { cors: { origin: CLIENT_ORIGIN } });
 
 // ---------- helpers ----------
 const id = () => crypto.randomUUID();
+// Socket payloads are untrusted: an id that isn't a string (or is missing) would make node:sqlite
+// throw while binding parameters, which in a socket handler takes down the whole process.
+const str = (v) => (typeof v === 'string' ? v : '');
 const publicUser = (u) => ({ id: u.id, username: u.username });
 const onlineUsers = new Map(); // userId -> number of open sockets
 
@@ -63,8 +67,83 @@ function serializeMessage(m, viewerId) {
   if (m.deletedForEveryone) {
     return { id: m.id, conversationId: m.conversationId, senderId: m.senderId, senderName: m.senderName, text: null, attachment: null, deleted: true, createdAt: m.createdAt };
   }
-  return { id: m.id, conversationId: m.conversationId, senderId: m.senderId, senderName: m.senderName, text: m.text || null, attachment: m.attachment || null, deleted: false, editedAt: m.editedAt || null, createdAt: m.createdAt };
+  return {
+    id: m.id,
+    conversationId: m.conversationId,
+    senderId: m.senderId,
+    senderName: m.senderName,
+    text: m.text || null,
+    attachment: m.attachment || null,
+    deleted: false,
+    editedAt: m.editedAt || null,
+    replyTo: m.replyToId ? replySnippet(m.replyToId, viewerId) : null,
+    mentions: m.mentions,
+    linkPreview: m.linkPreview,
+    reactions: db.getReactions(m.id),
+    ...db.getReceipts(m.id), // deliveredTo, readBy
+    createdAt: m.createdAt,
+  };
 }
+
+// The quoted part of a reply. Built at read time, so edits and deletions of the original show up.
+function replySnippet(replyToId, viewerId) {
+  const r = db.getMessage(replyToId);
+  if (!r) return null;
+  const gone = r.deletedForEveryone || db.isMessageDeletedForUser(r.id, viewerId);
+  return {
+    id: r.id,
+    senderId: r.senderId,
+    senderName: r.senderName,
+    text: gone ? null : r.text?.slice(0, 140) || null,
+    attachmentType: gone ? null : r.attachment?.type || null,
+    deleted: gone,
+  };
+}
+
+// Pushes the current state of an existing message (edit, reaction, deletion, link preview)
+// to every member. Unlike message:new, clients patch it in place without bumping unread counts.
+function emitMessageUpdate(messageId) {
+  const m = db.getMessage(messageId);
+  if (!m) return;
+  for (const uid of db.getMembers(m.conversationId)) {
+    const view = serializeMessage(m, uid);
+    if (view) io.to(uid).emit('message:updated', view);
+  }
+}
+
+function emitReceipts(conversationId, messageIds) {
+  const receipts = messageIds.map((mid) => ({ id: mid, ...db.getReceipts(mid) }));
+  for (const uid of db.getMembers(conversationId)) io.to(uid).emit('message:receipts', { conversationId, receipts });
+}
+
+// @username tokens that match another member of the conversation. Returns their user ids.
+function parseMentions(text, conversationId, senderId) {
+  const names = new Set([...String(text || '').matchAll(/(?:^|[^\w@])@([a-zA-Z0-9_]{3,20})(?![\w])/g)].map((m) => m[1].toLowerCase()));
+  if (!names.size) return [];
+  return db
+    .getMembers(conversationId)
+    .filter((mid) => mid !== senderId && names.has(db.findUserById(mid)?.username.toLowerCase()));
+}
+
+// Preview for the first link in `text`: returned right away if cached, otherwise fetched in the
+// background and pushed as a message:updated once ready (if the message still has that link).
+function previewFor(messageId, text) {
+  const url = normalizeUrl(extractFirstUrl(text));
+  if (!url) return null;
+  const cached = getCachedPreview(url);
+  if (cached !== undefined) return cached;
+  getLinkPreview(url).then((preview) => {
+    const cur = db.getMessage(messageId);
+    if (!preview || !cur || cur.deletedForEveryone || normalizeUrl(extractFirstUrl(cur.text)) !== url) return;
+    db.setLinkPreview(messageId, preview);
+    emitMessageUpdate(messageId);
+  });
+  return null;
+}
+
+// Exactly one emoji (including ZWJ sequences, flags, keycaps and skin tones).
+const isSingleEmoji = (s) => typeof s === 'string' && s.length <= 32 && /^\p{RGI_Emoji}$/v.test(s);
+const MAX_REACTIONS_PER_USER = 10;
 
 function conversationView(conversationId, viewerId) {
   const c = db.getConversation(conversationId);
@@ -245,20 +324,29 @@ io.on('connection', (socket) => {
   socket.join(uid); // personal room: everything for this user is sent here
   onlineUsers.set(uid, (onlineUsers.get(uid) || 0) + 1);
   io.emit('presence', { userId: uid, online: true });
+  // Anything sent while this user was offline has now reached one of their devices.
+  for (const [cid, ids] of Object.entries(db.markAllDelivered(uid, new Date().toISOString()))) emitReceipts(cid, ids);
 
-  socket.on('message:send', ({ conversationId, text, attachment }, ack) => {
+  socket.on('message:send', ({ conversationId, text, attachment, replyToId } = {}, ack) => {
+    conversationId = str(conversationId);
     const members = db.getMembers(conversationId);
     text = String(text || '').trim().slice(0, 2000);
     const hasAttachment = attachment?.url && attachment?.type;
     if (!members.includes(uid) || (!text && !hasAttachment)) return ack?.({ error: 'Cannot send' });
 
+    const original = replyToId ? db.getMessage(str(replyToId)) : null;
+    const validReply = original && original.conversationId === conversationId && !original.isSystem;
+    const msgId = id();
     const msg = db.createMessage({
-      id: id(),
+      id: msgId,
       conversationId,
       senderId: uid,
       senderName: socket.user.username,
       text: text || null,
       attachment: hasAttachment ? { url: attachment.url, type: attachment.type, name: attachment.name || null } : null,
+      replyToId: validReply ? original.id : null,
+      mentions: parseMentions(text, conversationId, uid),
+      linkPreview: previewFor(msgId, text),
       createdAt: new Date().toISOString(),
     });
     for (const mid of members) io.to(mid).emit('message:new', serializeMessage(msg, mid));
@@ -266,7 +354,8 @@ io.on('connection', (socket) => {
   });
 
   // Only the original sender can edit, and only while the message hasn't been redacted.
-  socket.on('message:edit', ({ messageId, text }, ack) => {
+  socket.on('message:edit', ({ messageId, text } = {}, ack) => {
+    messageId = str(messageId);
     const msg = db.getMessage(messageId);
     const members = msg && db.getMembers(msg.conversationId);
     if (!msg || !members?.includes(uid)) return ack?.({ error: 'Message not found' });
@@ -276,15 +365,20 @@ io.on('connection', (socket) => {
     text = String(text || '').trim().slice(0, 2000);
     if (!text) return ack?.({ error: 'Message cannot be empty' });
 
-    db.editMessage(messageId, text, new Date().toISOString());
-    const updated = db.getMessage(messageId);
-    for (const mid of members) io.to(mid).emit('message:new', serializeMessage(updated, mid));
+    const sameLink = msg.linkPreview && msg.linkPreview.url === normalizeUrl(extractFirstUrl(text));
+    db.editMessage(
+      messageId,
+      { text, mentions: parseMentions(text, msg.conversationId, uid), linkPreview: sameLink ? msg.linkPreview : previewFor(messageId, text) },
+      new Date().toISOString()
+    );
+    emitMessageUpdate(messageId);
     ack?.({ ok: true });
   });
 
   // mode: 'me' hides the message only for the caller; 'everyone' redacts it for all members
   // (and only the original sender is allowed to do that).
-  socket.on('message:delete', ({ messageId, mode }, ack) => {
+  socket.on('message:delete', ({ messageId, mode } = {}, ack) => {
+    messageId = str(messageId);
     const msg = db.getMessage(messageId);
     const members = msg && db.getMembers(msg.conversationId);
     if (!msg || !members?.includes(uid)) return ack?.({ error: 'Message not found' });
@@ -292,8 +386,7 @@ io.on('connection', (socket) => {
     if (mode === 'everyone') {
       if (msg.senderId !== uid) return ack?.({ error: 'Only the sender can delete for everyone' });
       db.setDeletedForEveryone(messageId);
-      const updated = db.getMessage(messageId);
-      for (const mid of members) io.to(mid).emit('message:new', serializeMessage(updated, mid));
+      emitMessageUpdate(messageId);
     } else {
       db.addMessageDeletionForUser(messageId, uid);
       io.to(uid).emit('message:removed', { id: messageId, conversationId: msg.conversationId });
@@ -301,7 +394,44 @@ io.on('connection', (socket) => {
     ack?.({ ok: true });
   });
 
-  socket.on('typing', ({ conversationId }) => {
+  // Toggles the caller's reaction. A user can add several different emojis to one message.
+  socket.on('message:react', ({ messageId, emoji } = {}, ack) => {
+    messageId = str(messageId);
+    const msg = db.getMessage(messageId);
+    if (!msg || msg.isSystem || !db.isMember(msg.conversationId, uid) || db.isMessageDeletedForUser(msg.id, uid))
+      return ack?.({ error: 'Message not found' });
+    if (msg.deletedForEveryone) return ack?.({ error: 'Cannot react to a deleted message' });
+    if (!isSingleEmoji(emoji)) return ack?.({ error: 'Invalid emoji' });
+    if (db.hasReaction(msg.id, uid, emoji)) db.removeReaction(msg.id, uid, emoji);
+    else if (db.countUserReactions(msg.id, uid) >= MAX_REACTIONS_PER_USER) return ack?.({ error: 'Too many reactions' });
+    else db.addReaction(msg.id, uid, emoji, new Date().toISOString());
+    emitMessageUpdate(msg.id);
+    ack?.({ ok: true });
+  });
+
+  // The client acks each message:new it receives, which marks it delivered to this user.
+  socket.on('message:ack', ({ messageIds } = {}) => {
+    if (!Array.isArray(messageIds)) return;
+    const now = new Date().toISOString();
+    const byConversation = {};
+    for (const mid of messageIds.slice(0, 100)) {
+      const m = db.getMessage(str(mid));
+      if (!m || m.isSystem || m.senderId === uid || !db.isMember(m.conversationId, uid)) continue;
+      if (db.markDelivered(m.id, uid, now)) (byConversation[m.conversationId] ||= []).push(m.id);
+    }
+    for (const [cid, ids] of Object.entries(byConversation)) emitReceipts(cid, ids);
+  });
+
+  // Sent when the user is looking at the conversation (open and window focused).
+  socket.on('conversation:read', ({ conversationId } = {}) => {
+    conversationId = str(conversationId);
+    if (!db.isMember(conversationId, uid)) return;
+    const ids = db.markConversationRead(conversationId, uid, new Date().toISOString());
+    if (ids.length) emitReceipts(conversationId, ids);
+  });
+
+  socket.on('typing', ({ conversationId } = {}) => {
+    conversationId = str(conversationId);
     if (!db.isMember(conversationId, uid)) return;
     for (const mid of db.getMembers(conversationId))
       if (mid !== uid) io.to(mid).emit('typing', { conversationId, username: socket.user.username });

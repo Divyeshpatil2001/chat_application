@@ -1,4 +1,8 @@
 import { useState } from 'react';
+import { notificationPermission, notificationsSupported, requestNotificationPermission } from '../notifications.js';
+
+const THEME_CYCLE = { system: 'light', light: 'dark', dark: 'system' };
+const THEME_ICON = { system: '🖥️', light: '☀️', dark: '🌙' };
 
 function previewText(c, user) {
   const lm = c.lastMessage;
@@ -10,8 +14,9 @@ function previewText(c, user) {
   return `${who}: ${lm.text}`;
 }
 
-export default function Sidebar({ user, users, conversations, activeId, unread, onOpen, onStartDirect, onNewGroup, onDeleteChat, onLogout }) {
+export default function Sidebar({ user, users, conversations, activeId, unread, theme, onOpen, onStartDirect, onNewGroup, onDeleteChat, onLogout }) {
   const [tab, setTab] = useState('chats');
+  const [permission, setPermission] = useState(notificationPermission);
   const [search, setSearch] = useState('');
   const q = search.toLowerCase();
 
@@ -19,7 +24,23 @@ export default function Sidebar({ user, users, conversations, activeId, unread, 
     <aside className="sidebar">
       <header className="sidebar-head">
         <div className="avatar">{user.username[0].toUpperCase()}</div>
-        <strong>{user.username}</strong>
+        <strong className="grow ellipsis">{user.username}</strong>
+        {notificationsSupported && permission === 'default' && (
+          <button
+            className="icon-btn"
+            title="Enable desktop notifications"
+            onClick={() => requestNotificationPermission().then(setPermission)}
+          >
+            🔔
+          </button>
+        )}
+        <button
+          className="icon-btn"
+          title={`Theme: ${theme.preference} (click to change)`}
+          onClick={() => theme.choose(THEME_CYCLE[theme.preference])}
+        >
+          {THEME_ICON[theme.preference]}
+        </button>
         <button className="link" onClick={onLogout}>Logout</button>
       </header>
 
